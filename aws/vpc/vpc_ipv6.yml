@@ -1,0 +1,103 @@
+---
+### provision AWS VPC
+- hosts: localhost
+  connection: local
+  gather_facts: false
+  pre_tasks:
+    - include_vars: vpc_vars.yml
+  tasks:
+    # Creating the VPC
+    - name: Create VPC
+      ec2_vpc_net:
+        name: "{{vpc_name}}"
+        cidr_block: "{{vpc_cidr_block}}"
+        region: "{{aws_region}}"
+        state: "present"
+      register: my_vpc
+
+    # Workaround while ec2_vpc_net has no IPv6 support
+    - name: Ensure VPC has a /56 IPv6 block assigned
+      command: aws ec2 associate-vpc-cidr-block
+        --amazon-provided-ipv6-cidr-block --vpc-id "{{my_vpc.vpc.id}}"
+      when: my_vpc.vpc.ipv6_cidr_block_association_set is not defined
+
+    # Extract VPC info into variables
+    - set_fact:
+        vpc_id: "{{my_vpc.vpc.id}}"
+        vpc_ipv6_cidr_block: "{{my_vpc.vpc.ipv6_cidr_block_association_set[0].ipv6_cidr_block}}"
+
+    - debug:
+        var: vpc_ipv6_cidr_block
+
+    # Creating VPC Subnets
+    - name: Create Public Subnets
+      ec2_vpc_subnet:
+        state: "present"
+        vpc_id: "{{vpc_id}}"
+        cidr: "{{item.cidr}}"
+        ipv6_cidr: "{{vpc_ipv6_cidr_block | ipsubnet(64,ansible_loop.index-1)}}"
+        assign_instances_ipv6: yes
+        map_public: yes
+        az: "{{item.zone}}"
+        region: "{{aws_region}}"
+        resource_tags:
+          Name: "Public Subnet {{ansible_loop.index}}"
+      loop:
+        "{{vpc_public_subnets}}"
+      loop_control:
+        extended: yes
+      register: my_public_subnet
+
+    # Save the id of the Public Subnets in a new variable
+    - set_fact: public_subnet_ids="[]"
+    - set_fact: public_subnet_ids="{{public_subnet_ids}} + [ '{{item.subnet.id}}' ]"
+      loop: "{{my_public_subnet.results}}"
+
+    # Every VPC needs at least one Internet Gateway
+    # to allow traffic between the VPC and the outside world
+    - name: Create Internet Gateway for VPC
+      ec2_vpc_igw:
+        vpc_id: "{{vpc_id}}"
+        region: "{{aws_region}}"
+        state: "present"
+      register: my_vpc_igw
+
+    # Set up Route Table for the Public Subnet
+    - name: Set up public subnet route table
+      ec2_vpc_route_table:
+        vpc_id: "{{vpc_id}}"
+        region: "{{aws_region}}"
+        tags:
+          Name: "Public"
+        subnets: "{{public_subnet_ids}}"
+        routes:
+          - dest: "0.0.0.0/0"
+            gateway_id: "{{my_vpc_igw.gateway_id}}"
+#          - dest6: "::/0"
+#            gateway_id: "{{my_vpc_igw.gateway_id}}"
+      register: my_route_table
+
+    # Workaround while ec2_vpc_route_table has no IPv6 support
+    - name: Route all IPv6 traffic to the Internet gateway
+      command: aws ec2 create-route
+        --route-table-id "{{my_route_table.route_table.id}}" --destination-ipv6-cidr-block ::/0 --gateway-id "{{my_vpc_igw.gateway_id}}"
+      ignore_errors: yes
+
+    # Create a Security Group to allow SSH access
+    # from your IP to the EC2 resources you will
+    # start in your VPC.
+    - name: Create Main Security Group
+      ec2_group:
+        name: "My Security Group"
+        description: "My Security Group"
+        vpc_id: "{{vpc_id}}"
+        region: "{{aws_region}}"
+        rules:
+          - proto: "tcp"
+            from_port: "22"
+            to_port: "22"
+            cidr_ip: "{{my_ip_range.ipv4}}"
+          - proto: "tcp"
+            from_port: "22"
+            to_port: "22"
+            cidr_ipv6: "{{my_ip_range.ipv6}}"
